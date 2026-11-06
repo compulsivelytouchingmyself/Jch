@@ -24,6 +24,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
 import java.util.UUID
@@ -50,7 +51,6 @@ class JumpCutRecorder(
     companion object {
         private const val TAG = "JumpCutRecorder"
         private const val VIDEO_MIME = MediaFormat.MIMETYPE_VIDEO_AVC
-        private const val AUDIO_MIME = MediaFormat.MIMETYPE_AUDIO_AAC
         private const val TARGET_FPS = 30
         private const val I_FRAME_INTERVAL = 1
     }
@@ -63,17 +63,18 @@ class JumpCutRecorder(
     private var recordingStartTime = 0L
     private var sessionId = ""
     private var chunkDir: File? = null
-    private val recordedChunkFiles = mutableListOf<File>()
+    private val recordedSegments = mutableListOf<ChunkSegment>()
 
-    // Current chunk muxer state
+    // Current chunk state
     private var currentChunkMuxer: MediaMuxer? = null
-    private var currentChunkFile: File? = null
+    private var currentVideoFile: File? = null
+    private var currentPcmFile: File? = null
+    private var currentPcmOut: FileOutputStream? = null
     private var currentChunkVideoTrack = -1
-    private var currentChunkAudioTrack = -1
     private var isCurrentChunkStarted = false
     private var chunkIndex = 0
     private var chunkStartTime = 0L
-    private val muxerLock = Any()
+    private val chunkLock = Any()
 
     // Video encoder
     private var videoEncoder: MediaCodec? = null
@@ -81,16 +82,10 @@ class JumpCutRecorder(
     private var videoOutputFormat: MediaFormat? = null
     private var videoDrainJob: Job? = null
 
-    // Audio encoder (CBR AAC)
-    private var audioEncoder: MediaCodec? = null
-    private var audioOutputFormat: MediaFormat? = null
-    private var audioDrainJob: Job? = null
-    private var audioSamplesRecorded = 0L
-
-    // Pre-roll video circular buffer (keyframes + recent frames)
-    private class EncodedPacket(val buffer: ByteArray, val info: MediaCodec.BufferInfo, val isKeyFrame: Boolean)
-    private val preRollVideoPackets = ArrayDeque<EncodedPacket>()
-    private val packetBufferLock = Any()
+    // Pre-roll video circular buffer
+    private class EncodedVideoPacket(val buffer: ByteArray, val info: MediaCodec.BufferInfo)
+    private val preRollVideoPackets = ArrayDeque<EncodedVideoPacket>()
+    private val videoBufferLock = Any()
 
     // Callbacks
     var onVideoCompleted: ((RecordedVideo) -> Unit)? = null
@@ -107,7 +102,6 @@ class JumpCutRecorder(
 
     fun prepareRecording(width: Int = 1280, height: Int = 720) {
         try {
-            // Configure Video MediaCodec with Camera2 surface
             val vFormat = MediaFormat.createVideoFormat(VIDEO_MIME, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
@@ -121,20 +115,9 @@ class JumpCutRecorder(
             }
 
             cameraHelper.setRecordingSurface(videoEncoderSurface)
-
-            // Configure Constant Bit Rate (CBR) Audio MediaCodec
-            val aFormat = MediaFormat.createAudioFormat(AUDIO_MIME, AudioCaptureService.SAMPLE_RATE, 1).apply {
-                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                setInteger(MediaFormat.KEY_BIT_RATE, settings.audioBitrate)
-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
-            }
-            audioEncoder = MediaCodec.createEncoderByType(AUDIO_MIME).apply {
-                configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                start()
-            }
-            Log.d(TAG, "Recording encoders prepared with CBR audio bitrate: ${settings.audioBitrate}")
+            Log.d(TAG, "Video encoder prepared with input surface")
         } catch (e: Exception) {
-            Log.e(TAG, "Error preparing hardware encoders", e)
+            Log.e(TAG, "Error preparing video encoder", e)
         }
     }
 
@@ -143,12 +126,11 @@ class JumpCutRecorder(
         recordingScope = scope
         sessionId = UUID.randomUUID().toString().take(8)
         chunkDir = storageManager.createChunkDirectory(sessionId)
-        recordedChunkFiles.clear()
+        recordedSegments.clear()
         chunkIndex = 0
-        audioSamplesRecorded = 0L
         recordingStartTime = System.currentTimeMillis()
 
-        if (videoEncoder == null || audioEncoder == null) {
+        if (videoEncoder == null) {
             prepareRecording()
         }
 
@@ -157,22 +139,22 @@ class JumpCutRecorder(
             statusText = "Waiting for speech..."
         )
 
-        startEncoderDraining(scope)
+        startVideoDraining(scope)
 
-        // Live stats tracking
+        // Live stats tracking loop
         statsJob = scope.launch(Dispatchers.Main) {
             while (isActive && _recordingStats.value.isRecording) {
                 val now = System.currentTimeMillis()
                 val elapsed = now - recordingStartTime
                 val currentChunkDur = if (isCurrentChunkStarted) now - chunkStartTime else 0L
 
-                val totalCutDuration = recordedChunkFiles.sumOf { getChunkDurationEstimate(it) } + currentChunkDur
+                val totalCutDuration = recordedSegments.sumOf { getSegmentDurationEstimate(it) } + currentChunkDur
                 val estimatedSaved = (elapsed - totalCutDuration).coerceAtLeast(0L)
 
                 _recordingStats.value = _recordingStats.value.copy(
                     elapsedRealtimeMs = elapsed,
                     estimatedSavedMs = estimatedSaved,
-                    chunkCount = recordedChunkFiles.size + (if (isCurrentChunkStarted) 1 else 0),
+                    chunkCount = recordedSegments.size + (if (isCurrentChunkStarted) 1 else 0),
                     currentChunkDurationMs = currentChunkDur,
                     statusText = when (audioCaptureService.meterData.value.state) {
                         SpeechState.SPEAKING -> "RECORDING SPEECH"
@@ -187,8 +169,7 @@ class JumpCutRecorder(
         }
     }
 
-    private fun startEncoderDraining(scope: CoroutineScope) {
-        // Video Drainer
+    private fun startVideoDraining(scope: CoroutineScope) {
         videoDrainJob = scope.launch(Dispatchers.IO) {
             val vEncoder = videoEncoder ?: return@launch
             val bufferInfo = MediaCodec.BufferInfo()
@@ -210,56 +191,26 @@ class JumpCutRecorder(
                         val bytes = ByteArray(bufferInfo.size)
                         encodedBuffer.get(bytes)
 
-                        val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                        val packet = EncodedPacket(bytes, bufferInfo, isKey)
+                        val packet = EncodedVideoPacket(bytes, bufferInfo)
                         handleVideoPacket(packet)
                     }
                     vEncoder.releaseOutputBuffer(outIndex, false)
                 }
             }
         }
-
-        // Audio Drainer (CBR AAC)
-        audioDrainJob = scope.launch(Dispatchers.IO) {
-            val aEncoder = audioEncoder ?: return@launch
-            val bufferInfo = MediaCodec.BufferInfo()
-
-            while (isActive && _recordingStats.value.isRecording) {
-                val outIndex = try {
-                    aEncoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                } catch (e: Exception) { -1 }
-
-                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    audioOutputFormat = aEncoder.outputFormat
-                    Log.d(TAG, "Audio encoder output format ready")
-                } else if (outIndex >= 0) {
-                    val encodedBuffer = aEncoder.getOutputBuffer(outIndex)
-                    if (encodedBuffer != null && bufferInfo.size > 0) {
-                        encodedBuffer.position(bufferInfo.offset)
-                        encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
-
-                        val bytes = ByteArray(bufferInfo.size)
-                        encodedBuffer.get(bytes)
-
-                        handleAudioPacket(bytes, bufferInfo)
-                    }
-                    aEncoder.releaseOutputBuffer(outIndex, false)
-                }
-            }
-        }
     }
 
-    private fun handleVideoPacket(packet: EncodedPacket) {
-        synchronized(muxerLock) {
+    private fun handleVideoPacket(packet: EncodedVideoPacket) {
+        synchronized(chunkLock) {
             if (isCurrentChunkStarted && currentChunkMuxer != null && currentChunkVideoTrack != -1) {
                 try {
                     val byteBuffer = ByteBuffer.wrap(packet.buffer)
                     currentChunkMuxer?.writeSampleData(currentChunkVideoTrack, byteBuffer, packet.info)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error writing video sample", e)
+                    Log.e(TAG, "Error writing video sample to chunk", e)
                 }
             } else {
-                synchronized(packetBufferLock) {
+                synchronized(videoBufferLock) {
                     preRollVideoPackets.addLast(packet)
                     val maxPreRollUs = settings.preRollMs * 1000L
                     while (preRollVideoPackets.size > 1 &&
@@ -271,85 +222,59 @@ class JumpCutRecorder(
         }
     }
 
-    private fun handleAudioPacket(bytes: ByteArray, bufferInfo: MediaCodec.BufferInfo) {
-        synchronized(muxerLock) {
-            if (isCurrentChunkStarted && currentChunkMuxer != null && currentChunkAudioTrack != -1) {
-                try {
-                    val byteBuffer = ByteBuffer.wrap(bytes)
-                    currentChunkMuxer?.writeSampleData(currentChunkAudioTrack, byteBuffer, bufferInfo)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error writing audio sample", e)
-                }
-            }
-        }
-    }
-
     /**
-     * Feed raw PCM bytes into audio encoder.
-     * Native byte-order is preserved directly via inputBuffer.put(bytes),
-     * completely eliminating digital static / screeching!
+     * Live raw PCM audio streaming from microphone directly to file.
+     * 100% untouched, unamplified, and unfiltered.
      */
     override fun onPcmAudioAvailable(bytes: ByteArray, length: Int, timestampNs: Long) {
         if (!_recordingStats.value.isRecording) return
-        val aEncoder = audioEncoder ?: return
-
-        try {
-            val inIndex = aEncoder.dequeueInputBuffer(5_000)
-            if (inIndex >= 0) {
-                val inputBuffer = aEncoder.getInputBuffer(inIndex)
-                inputBuffer?.clear()
-                // Direct native byte copy - zero byte swapping errors!
-                inputBuffer?.put(bytes, 0, length)
-
-                // Monotonic CBR presentation timestamp
-                val ptsUs = (audioSamplesRecorded * 1_000_000L) / AudioCaptureService.SAMPLE_RATE
-                val samplesCount = length / AudioCaptureService.BYTES_PER_SAMPLE
-                audioSamplesRecorded += samplesCount
-
-                aEncoder.queueInputBuffer(inIndex, 0, length, ptsUs, 0)
+        synchronized(chunkLock) {
+            if (isCurrentChunkStarted) {
+                try {
+                    currentPcmOut?.write(bytes, 0, length)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error writing raw PCM audio", e)
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error feeding PCM into audio encoder", e)
         }
     }
 
     override fun onSpeechSegmentStarted(preRollBuffers: List<AudioCaptureService.PcmBuffer>) {
         if (!_recordingStats.value.isRecording) return
 
-        synchronized(muxerLock) {
+        synchronized(chunkLock) {
             if (isCurrentChunkStarted) return
 
             try {
-                val chunkFile = File(chunkDir, "chunk_${String.format("%04d", chunkIndex)}.mp4")
-                currentChunkFile = chunkFile
+                val prefix = String.format("chunk_%04d", chunkIndex)
+                val videoFile = File(chunkDir, "$prefix.mp4")
+                val pcmFile = File(chunkDir, "$prefix.pcm")
+                currentVideoFile = videoFile
+                currentPcmFile = pcmFile
                 chunkStartTime = System.currentTimeMillis()
 
+                // 1. Open raw PCM stream and immediately dump pre-roll microphone buffers
+                val pcmOut = FileOutputStream(pcmFile)
+                currentPcmOut = pcmOut
+                for (p in preRollBuffers) {
+                    pcmOut.write(p.bytes, 0, p.length)
+                }
+
+                // 2. Open video chunk muxer
                 val vFormat = videoOutputFormat ?: MediaFormat.createVideoFormat(VIDEO_MIME, 1280, 720).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                     setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
                     setInteger(MediaFormat.KEY_FRAME_RATE, TARGET_FPS)
                 }
-                val aFormat = audioOutputFormat ?: MediaFormat.createAudioFormat(AUDIO_MIME, AudioCaptureService.SAMPLE_RATE, 1).apply {
-                    setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                    setInteger(MediaFormat.KEY_BIT_RATE, settings.audioBitrate)
-                }
 
-                val muxer = MediaMuxer(chunkFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                val muxer = MediaMuxer(videoFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 currentChunkVideoTrack = muxer.addTrack(vFormat)
-                currentChunkAudioTrack = muxer.addTrack(aFormat)
                 muxer.start()
-
                 currentChunkMuxer = muxer
                 isCurrentChunkStarted = true
-                Log.d(TAG, "Started speech chunk ${chunkFile.name}")
 
-                // 1. Feed pre-roll PCM buffers into audio encoder seamlessly
-                for (p in preRollBuffers) {
-                    onPcmAudioAvailable(p.bytes, p.length, p.timestampNs)
-                }
-
-                // 2. Flush pre-roll video packets into chunk muxer
-                synchronized(packetBufferLock) {
+                // 3. Flush pre-roll video packets into chunk muxer
+                synchronized(videoBufferLock) {
                     while (preRollVideoPackets.isNotEmpty()) {
                         val p = preRollVideoPackets.removeFirst()
                         try {
@@ -360,8 +285,9 @@ class JumpCutRecorder(
                         }
                     }
                 }
+                Log.d(TAG, "Started speech segment $prefix")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start chunk muxer", e)
+                Log.e(TAG, "Failed to start speech segment", e)
             }
         }
     }
@@ -372,25 +298,35 @@ class JumpCutRecorder(
     }
 
     private fun closeCurrentChunk() {
-        synchronized(muxerLock) {
+        synchronized(chunkLock) {
             if (!isCurrentChunkStarted) return
             try {
+                // Close raw PCM stream
+                currentPcmOut?.flush()
+                currentPcmOut?.close()
+                currentPcmOut = null
+
+                // Close video chunk muxer
                 currentChunkMuxer?.stop()
                 currentChunkMuxer?.release()
-                currentChunkFile?.let { file ->
-                    if (file.exists() && file.length() > 512) {
-                        recordedChunkFiles.add(file)
-                        Log.d(TAG, "Saved chunk ${file.name} (${file.length()} bytes)")
-                    }
+                currentChunkMuxer = null
+
+                val vFile = currentVideoFile
+                val pFile = currentPcmFile
+                if (vFile != null && vFile.exists() && vFile.length() > 512 &&
+                    pFile != null && pFile.exists() && pFile.length() > 0) {
+                    recordedSegments.add(ChunkSegment(vFile, pFile))
+                    Log.d(TAG, "Saved segment: ${vFile.name} (${vFile.length()}b), ${pFile.name} (${pFile.length()}b)")
                 }
                 chunkIndex++
             } catch (e: Exception) {
-                Log.e(TAG, "Error closing chunk muxer", e)
+                Log.e(TAG, "Error closing speech segment", e)
             } finally {
                 currentChunkMuxer = null
-                currentChunkFile = null
+                currentVideoFile = null
+                currentPcmFile = null
+                currentPcmOut = null
                 currentChunkVideoTrack = -1
-                currentChunkAudioTrack = -1
                 isCurrentChunkStarted = false
             }
         }
@@ -403,20 +339,20 @@ class JumpCutRecorder(
         closeCurrentChunk()
         statsJob?.cancel()
         videoDrainJob?.cancel()
-        audioDrainJob?.cancel()
 
         _recordingStats.value = _recordingStats.value.copy(
             isRecording = false,
             isRemuxing = true,
-            statusText = "Remuxing jump cut video fresh..."
+            statusText = "Remuxing clean jump cut video..."
         )
 
         recordingScope?.launch(Dispatchers.IO) {
             val finalOutputFile = storageManager.createNewVideoOutputFile()
-            val remuxResult = ScorchedEarthRemuxer.remuxChunks(
-                chunkFiles = recordedChunkFiles.toList(),
+            val remuxResult = ScorchedEarthRemuxer.remux(
+                segments = recordedSegments.toList(),
                 outputFile = finalOutputFile,
-                originalDurationMs = totalElapsed
+                originalDurationMs = totalElapsed,
+                sampleRate = audioCaptureService.sampleRate
             )
 
             withContext(Dispatchers.Main) {
@@ -446,25 +382,20 @@ class JumpCutRecorder(
         }
     }
 
-    private fun getChunkDurationEstimate(file: File): Long {
-        return if (file.exists()) (file.length() / 500L).coerceAtLeast(200L) else 0L
+    private fun getSegmentDurationEstimate(segment: ChunkSegment): Long {
+        // Raw PCM at 44100Hz mono 16-bit is 88,200 bytes per second
+        return if (segment.pcmFile.exists()) (segment.pcmFile.length() / 88L).coerceAtLeast(100L) else 0L
     }
 
     fun release() {
         closeCurrentChunk()
         statsJob?.cancel()
         videoDrainJob?.cancel()
-        audioDrainJob?.cancel()
         try {
             videoEncoder?.stop()
             videoEncoder?.release()
         } catch (ignored: Exception) {}
         videoEncoder = null
-        try {
-            audioEncoder?.stop()
-            audioEncoder?.release()
-        } catch (ignored: Exception) {}
-        audioEncoder = null
         videoEncoderSurface?.release()
         videoEncoderSurface = null
     }

@@ -1,9 +1,16 @@
 package com.jarron.jch.audio
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.util.Log
 import com.jarron.jch.data.JumpCutSettings
 import kotlinx.coroutines.CoroutineScope
@@ -19,15 +26,19 @@ import kotlin.math.log10
 import kotlin.math.sqrt
 
 class AudioCaptureService(
+    private val context: Context? = null,
     private var settings: JumpCutSettings
 ) {
     companion object {
         private const val TAG = "AudioCaptureService"
-        const val SAMPLE_RATE = 44100
         const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        const val BYTES_PER_SAMPLE = 2 // 16-bit PCM
+        const val SAMPLES_PER_FRAME = 1024
+        const val BYTES_PER_SAMPLE = 2 // 16-bit PCM = 2 bytes per sample
     }
+
+    // Determine native sample rate directly from the hardware to avoid quantization and resampling errors
+    val sampleRate: Int = determineNativeSampleRate(context)
 
     class PcmBuffer(
         val bytes: ByteArray,
@@ -50,7 +61,10 @@ class AudioCaptureService(
     private var captureJob: Job? = null
     private var isCapturing = false
 
-    // Circular pre-roll memory buffer
+    // Active audio effect handles to ensure they stay explicitly disabled throughout capture
+    private val activeEffects = mutableListOf<AudioEffect>()
+
+    // Circular pre-roll buffer of raw, untouched PCM bytes
     private val preRollQueue = ArrayDeque<PcmBuffer>()
     private val preRollLock = Any()
 
@@ -69,31 +83,59 @@ class AudioCaptureService(
         this.settings = newSettings
     }
 
+    private fun determineNativeSampleRate(context: Context?): Int {
+        if (context != null) {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val propRate = audioManager?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
+            if (propRate != null && (propRate == 48000 || propRate == 44100)) {
+                val minBuf = AudioRecord.getMinBufferSize(propRate, CHANNEL_CONFIG, AUDIO_FORMAT)
+                if (minBuf > 0) {
+                    Log.d(TAG, "Device native sample rate detected: $propRate Hz")
+                    return propRate
+                }
+            }
+        }
+        // Check 48000 (standard for modern Android HAL), then 44100
+        return if (AudioRecord.getMinBufferSize(48000, CHANNEL_CONFIG, AUDIO_FORMAT) > 0) {
+            48000
+        } else {
+            44100
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun startCapture(scope: CoroutineScope) {
         if (isCapturing) return
         isCapturing = true
 
-        val minBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
-        val internalBufferSize = (minBufSize * 4).coerceAtLeast(8192)
+        val minBufSize = AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT)
+        if (minBufSize <= 0) {
+            Log.e(TAG, "AudioRecord minBufferSize error: $minBufSize for sampleRate=$sampleRate")
+            isCapturing = false
+            return
+        }
+
+        // Validate and configure buffer size:
+        // Must be an integer multiple of SAMPLES_PER_FRAME * BYTES_PER_SAMPLE (1024 * 2 = 2048 bytes)
+        // and comfortably exceed minBufSize (at least 4x) to avoid underrun / buffer overflow glitches
+        val frameBytes = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE // 2048 bytes
+        var internalBufferSize = maxOf(minBufSize * 4, 16384)
+        if (internalBufferSize % frameBytes != 0) {
+            internalBufferSize = ((internalBufferSize / frameBytes) + 1) * frameBytes
+        }
+
+        Log.d(TAG, "Configured AudioRecord buffer size: $internalBufferSize bytes for native sampleRate=$sampleRate Hz (minBufSize=$minBufSize)")
+
+        audioRecord = createAudioRecord(internalBufferSize)
+        if (audioRecord == null) {
+            Log.e(TAG, "AudioRecord failed to initialize with all candidate audio sources")
+            isCapturing = false
+            return
+        }
 
         try {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG,
-                AUDIO_FORMAT,
-                internalBufferSize
-            )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize")
-                isCapturing = false
-                return
-            }
-
             audioRecord?.startRecording()
-            Log.d(TAG, "AudioCaptureService started recording at $SAMPLE_RATE Hz")
+            Log.d(TAG, "AudioCaptureService recording started at $sampleRate Hz (source=${audioRecord?.audioSource}, session=${audioRecord?.audioSessionId})")
         } catch (e: Exception) {
             Log.e(TAG, "Error starting AudioRecord", e)
             isCapturing = false
@@ -101,20 +143,26 @@ class AudioCaptureService(
         }
 
         captureJob = scope.launch(Dispatchers.Default) {
-            // Read 1024 samples = 2048 bytes per read chunk
-            val readChunkSize = 2048
-            val audioBuffer = ByteArray(readChunkSize)
+            val shortBuffer = ShortArray(SAMPLES_PER_FRAME)
             var lastUiUpdate = 0L
 
             while (isActive && isCapturing) {
-                val bytesRead = audioRecord?.read(audioBuffer, 0, readChunkSize) ?: -1
-                if (bytesRead > 0) {
+                // Use READ_BLOCKING to guarantee exact 1024-sample frame reads without partial-read truncation
+                val shortsRead = audioRecord?.read(shortBuffer, 0, SAMPLES_PER_FRAME, AudioRecord.READ_BLOCKING) ?: -1
+                if (shortsRead > 0) {
                     val nowNs = System.nanoTime()
                     val nowMs = System.currentTimeMillis()
 
-                    // Pure raw native byte copy for pre-roll buffer & encoder
-                    val chunkBytes = audioBuffer.copyOf(bytesRead)
-                    val pcmBuffer = PcmBuffer(chunkBytes, bytesRead, nowNs)
+                    // Convert raw 16-bit shorts directly to pure Little-Endian PCM bytes
+                    // Never modified, amplified, or distorted: 100% raw untouched microphone audio!
+                    val pcmBytes = ByteArray(shortsRead * 2)
+                    for (i in 0 until shortsRead) {
+                        val s = shortBuffer[i].toInt()
+                        pcmBytes[i * 2] = (s and 0xFF).toByte()         // Little-endian low byte
+                        pcmBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte() // Little-endian high byte
+                    }
+
+                    val pcmBuffer = PcmBuffer(pcmBytes, pcmBytes.size, nowNs)
 
                     // Maintain circular pre-roll buffer in memory
                     synchronized(preRollLock) {
@@ -125,25 +173,20 @@ class AudioCaptureService(
                         }
                     }
 
-                    // Compute RMS amplitude directly from 16-bit Little-Endian bytes
-                    // Native PCM 16-bit on Android: byte[0]=low, byte[1]=high
+                    // Compute RMS amplitude for silence/speech detection ONLY
                     var sumSquares = 0.0
-                    val sampleCount = bytesRead / BYTES_PER_SAMPLE
-                    for (i in 0 until bytesRead - 1 step 2) {
-                        val low = chunkBytes[i].toInt() and 0xFF
-                        val high = chunkBytes[i + 1].toInt()
-                        val sample = (high shl 8) or low
-                        sumSquares += sample * sample
+                    for (i in 0 until shortsRead) {
+                        val s = shortBuffer[i].toDouble()
+                        sumSquares += s * s
                     }
-
-                    val rms = if (sampleCount > 0) sqrt(sumSquares / sampleCount) else 0.0
-                    val rawDb = if (rms > 0) {
+                    val rms = sqrt(sumSquares / shortsRead)
+                    val rawDb = if (rms > 0.0) {
                         (20.0 * log10(rms / 32767.0) + 90.0).toFloat().coerceIn(0f, 100f)
                     } else {
                         0f
                     }
 
-                    // Room Tone Calibration & Baseline Tracking
+                    // Ambient Room Tone Calibration & Baseline Tracking
                     if (isCalibrating) {
                         calibrationSamples.add(rawDb)
                         if (nowMs - calibrationStartTime > 2000L) {
@@ -161,7 +204,7 @@ class AudioCaptureService(
                         }
                     }
 
-                    // Broadcast Dynamic Range Compression:
+                    // Broadcast Dynamic Range Compression (used ONLY as detection metric):
                     // Separates ambient noise floor from spoken words distinctly
                     val thresholdDb = (roomToneBaseline + settings.noiseGateOffsetDb).coerceIn(15f, 85f)
                     val compressedDb = applyDynamicCompression(rawDb, thresholdDb, settings.compressorRatio)
@@ -175,7 +218,7 @@ class AudioCaptureService(
                             if (currentSpeechState == SpeechState.IDLE_MONITORING || currentSpeechState == SpeechState.SILENCE_CUT) {
                                 speechStartTime = nowMs
                                 newState = SpeechState.SPEAKING
-                                // Trigger cut start with pre-roll buffer dump
+                                // Trigger cut start with raw pre-roll buffer dump
                                 val preRollList: List<PcmBuffer>
                                 synchronized(preRollLock) {
                                     preRollList = preRollQueue.toList()
@@ -201,9 +244,9 @@ class AudioCaptureService(
                     }
                     currentSpeechState = newState
 
-                    // Send live audio bytes to active speech segment
+                    // Stream raw, untouched PCM bytes to active speech segment
                     if (currentSpeechState == SpeechState.SPEAKING || currentSpeechState == SpeechState.POST_ROLL) {
-                        captureListener?.onPcmAudioAvailable(chunkBytes, bytesRead, nowNs)
+                        captureListener?.onPcmAudioAvailable(pcmBytes, pcmBytes.size, nowNs)
                     }
 
                     // Update UI meter at ~30 FPS
@@ -221,6 +264,86 @@ class AudioCaptureService(
                     }
                 }
             }
+        }
+    }
+
+    private fun createAudioRecord(bufferSize: Int): AudioRecord? {
+        // Priority 1: MediaRecorder.AudioSource.UNPROCESSED
+        // Designed specifically in Android 7.0+ (API 24+) to bypass all hardware AGC, noise suppression, and speech notch filters.
+        val sources = mutableListOf<Int>()
+        sources.add(MediaRecorder.AudioSource.UNPROCESSED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            sources.add(MediaRecorder.AudioSource.VOICE_PERFORMANCE)
+        }
+        sources.add(MediaRecorder.AudioSource.CAMCORDER)
+        sources.add(MediaRecorder.AudioSource.MIC)
+
+        for (src in sources) {
+            try {
+                val record = AudioRecord(src, sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.d(TAG, "AudioRecord initialized with source=$src at $sampleRate Hz")
+                    // Explicitly disable any OS or DSP filters on this audio session
+                    disableAllAudioProcessing(record.audioSessionId)
+                    return record
+                }
+                record.release()
+            } catch (ignored: Exception) {}
+        }
+        return null
+    }
+
+    /**
+     * Explicitly disables Automatic Gain Control (AGC), Noise Suppressor (NS),
+     * and Acoustic Echo Canceler (AEC) on the AudioRecord session to ensure 100% raw PCM capture.
+     */
+    private fun disableAllAudioProcessing(audioSessionId: Int) {
+        // 1. Disable Automatic Gain Control (AGC)
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                val agc = AutomaticGainControl.create(audioSessionId)
+                if (agc != null) {
+                    agc.enabled = false
+                    activeEffects.add(agc)
+                    Log.d(TAG, "Explicitly disabled AutomaticGainControl on session $audioSessionId")
+                }
+            } else {
+                Log.d(TAG, "AutomaticGainControl is not active/available on this device")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not disable AutomaticGainControl", t)
+        }
+
+        // 2. Disable Noise Suppressor (NS)
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                val ns = NoiseSuppressor.create(audioSessionId)
+                if (ns != null) {
+                    ns.enabled = false
+                    activeEffects.add(ns)
+                    Log.d(TAG, "Explicitly disabled NoiseSuppressor on session $audioSessionId")
+                }
+            } else {
+                Log.d(TAG, "NoiseSuppressor is not active/available on this device")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not disable NoiseSuppressor", t)
+        }
+
+        // 3. Disable Acoustic Echo Canceler (AEC)
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                val aec = AcousticEchoCanceler.create(audioSessionId)
+                if (aec != null) {
+                    aec.enabled = false
+                    activeEffects.add(aec)
+                    Log.d(TAG, "Explicitly disabled AcousticEchoCanceler on session $audioSessionId")
+                }
+            } else {
+                Log.d(TAG, "AcousticEchoCanceler is not active/available on this device")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not disable AcousticEchoCanceler", t)
         }
     }
 
@@ -244,6 +367,16 @@ class AudioCaptureService(
         isCapturing = false
         captureJob?.cancel()
         captureJob = null
+
+        // Release all audio effect handles
+        for (effect in activeEffects) {
+            try {
+                effect.enabled = false
+                effect.release()
+            } catch (ignored: Exception) {}
+        }
+        activeEffects.clear()
+
         try {
             audioRecord?.stop()
             audioRecord?.release()

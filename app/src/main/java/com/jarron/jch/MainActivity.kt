@@ -44,7 +44,7 @@ class MainActivity : ComponentActivity() {
         settingsManager = SettingsManager(applicationContext)
         storageManager = VideoStorageManager(applicationContext)
         cameraHelper = Camera2Helper(applicationContext)
-        audioCaptureService = AudioCaptureService(settingsManager.settings.value)
+        audioCaptureService = AudioCaptureService(applicationContext, settingsManager.settings.value)
         recorder = JumpCutRecorder(
             context = applicationContext,
             cameraHelper = cameraHelper,

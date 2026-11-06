@@ -45,4 +45,17 @@ class JumpCutHeroTest {
         assertEquals(2048, buffer.length)
         assertEquals(1_000_000L, buffer.timestampNs)
     }
+
+    @Test
+    fun testAacCsd0Generation() {
+        val csd44k = com.jarron.jch.recorder.ScorchedEarthRemuxer.generateAacCsd0(44100, 1)
+        assertEquals(2, csd44k.size)
+        assertEquals(0x12.toByte(), csd44k[0])
+        assertEquals(0x08.toByte(), csd44k[1])
+
+        val csd48k = com.jarron.jch.recorder.ScorchedEarthRemuxer.generateAacCsd0(48000, 1)
+        assertEquals(2, csd48k.size)
+        assertEquals(0x11.toByte(), csd48k[0])
+        assertEquals(0x88.toByte(), csd48k[1])
+    }
 }
